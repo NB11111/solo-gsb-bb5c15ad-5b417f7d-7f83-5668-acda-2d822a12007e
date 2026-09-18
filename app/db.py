@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 import threading
 from pathlib import Path
+
+from . import audit
 
 DEFAULT_DB_PATH = "data/reservations.db"
 
@@ -34,7 +37,23 @@ CREATE TABLE IF NOT EXISTS reservation_participants (
 );
 CREATE INDEX IF NOT EXISTS idx_rp_participant_window
     ON reservation_participants (participant_id, start_utc, end_utc);
+CREATE TABLE IF NOT EXISTS reservation_events (
+    reservation_id  INTEGER NOT NULL REFERENCES reservations(id) ON DELETE CASCADE,
+    seq             INTEGER NOT NULL,  -- 该预约维度下从 1 递增的事件序号
+    action          TEXT NOT NULL,     -- create / reschedule / cancel / baseline
+    event_at        TEXT NOT NULL,     -- 事件时间（UTC 定宽文本）
+    snapshot        TEXT NOT NULL,     -- 事件落定后预约的完整快照（规范化 JSON）
+    prev_hash       TEXT NOT NULL,     -- 上一条事件哈希；首条为 64 个 0
+    event_hash      TEXT NOT NULL,     -- SHA-256(prev_hash ASCII 字节 + canonical_event UTF-8 字节)
+    canonical_event TEXT NOT NULL,     -- 被摘要的规范事件 JSON（无哈希字段/键排序/无空白）
+    PRIMARY KEY (reservation_id, seq)
+);
 """
+
+_RESERVATION_COLUMNS = (
+    "id, request_id, start_utc, end_utc, participants_key, version,"
+    " status, canceled_at, created_at"
+)
 
 _init_lock = threading.Lock()
 _initialized: set[str] = set()
@@ -60,14 +79,71 @@ def connect(db_path: str | None = None) -> sqlite3.Connection:
     return conn
 
 
+def snapshot_from_row(row: sqlite3.Row) -> dict:
+    """从 ``reservations`` 行构造审计事件里的预约快照。
+
+    快照直接取存储值（UTC 定宽文本），字段与预约对外响应一一对应；
+    事件由同事务内刚写定的行构造，保证“事件记录的就是已提交结果”。
+    """
+    return {
+        "reservation_id": row["id"],
+        "request_id": row["request_id"],
+        "start_utc": row["start_utc"],
+        "end_utc": row["end_utc"],
+        "participants": json.loads(row["participants_key"]),
+        "version": row["version"],
+        "status": row["status"],
+        "canceled_at": row["canceled_at"],
+        "created_at": row["created_at"],
+    }
+
+
+def _backfill_baseline_events(conn: sqlite3.Connection) -> None:
+    """为升级前已存在、但尚无事件的预约补写 ``baseline`` 事件。
+
+    - 基线事件按预约 id 顺序逐条补写，各自独立从序号 1 起链（哈希链是
+      **每条预约**一条），事件时间取迁移当时——只声明“迁移时刻观察到该
+      预约处于此状态”，**不伪造**其过去真实发生过的 create/reschedule/
+      cancel 操作；
+    - 已存在事件的预约（含重复执行本迁移）一律跳过，因此幂等；
+    - 全程在单个事务内，失败整体回滚，既有预约数据不受影响。
+    """
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        rows = conn.execute(
+            f"SELECT {_RESERVATION_COLUMNS} FROM reservations ORDER BY id"
+        ).fetchall()
+        for row in rows:
+            exists = conn.execute(
+                "SELECT 1 FROM reservation_events WHERE reservation_id = ? LIMIT 1",
+                (row["id"],),
+            ).fetchone()
+            if exists is not None:
+                continue
+            audit.append_event(
+                conn,
+                reservation_id=row["id"],
+                action=audit.ACTION_BASELINE,
+                snapshot=snapshot_from_row(row),
+            )
+        conn.execute("COMMIT")
+    except BaseException:
+        conn.rollback()
+        raise
+
+
 def init_db(db_path: str | None = None) -> None:
     """建表（幂等）。应用启动时调用一次即可。
 
     对升级前已存在的 SQLite 数据库执行**无损在线迁移**：
-    若 ``reservations`` 表缺少 ``version`` / ``status`` / ``canceled_at`` 列，
-    则逐列以 ``ALTER TABLE ADD COLUMN`` 补齐——既有行自动得到
-    ``version=1``、``status='active'``、``canceled_at=NULL``，
-    其余数据（含参与者占用）保持不变。
+
+    - 若 ``reservations`` 表缺少 ``version`` / ``status`` / ``canceled_at`` 列，
+      逐列以 ``ALTER TABLE ADD COLUMN`` 补齐——既有行自动得到
+      ``version=1``、``status='active'``、``canceled_at=NULL``；
+    - 新建 ``reservation_events`` 审计表（不存在时），并为每条**既有预约**
+      补写一条 ``baseline`` 事件作为哈希链起点：序号 1、prev_hash 为
+      64 个 ``0``，快照为该预约迁移当时的完整状态；不伪造任何旧操作，
+      此后的改期/取消事件自然续在基线之后。
     """
     path = db_path or get_db_path()
     with _init_lock:
@@ -90,6 +166,8 @@ def init_db(db_path: str | None = None) -> None:
                 # 可空列：既有行自动为 NULL（未取消）
                 conn.execute(
                     "ALTER TABLE reservations ADD COLUMN canceled_at TEXT")
+            # 既有预约补写基线事件（仅对没有事件的预约；幂等且无损）
+            _backfill_baseline_events(conn)
         finally:
             conn.close()
         _initialized.add(path)

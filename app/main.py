@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from . import db as db_module
 from . import reservations as reservation_core
 from . import scheduling
+from .audit import ChainVerificationError
 from .reservations import (
     RequestIdConflictError,
     ReservationCanceledError,
@@ -28,9 +29,12 @@ from .schemas import (
     AggregationResponse,
     LocalTimeOut,
     ParticipantIn,
+    ReservationHistoryEvent,
+    ReservationHistoryResponse,
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
+    ReservationSnapshot,
     SegmentOut,
     WEEKDAY_NAMES,
 )
@@ -53,8 +57,10 @@ app = FastAPI(
         "DST 按具体日期应用：不存在的本地时刻返回 400，歧义时刻统一取 fold=0。"
         "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等，"
         "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）。"
+        "成功创建/改期/取消在同一事务内追加哈希链审计事件，可经 "
+        "GET /api/v1/reservations/{id}/history 按序读取并整链重验。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -62,6 +68,14 @@ app = FastAPI(
 @app.exception_handler(SchedulingError)
 async def scheduling_error_handler(request, exc: SchedulingError) -> JSONResponse:
     return JSONResponse(status_code=400, content={"detail": str(exc)})
+
+
+@app.exception_handler(ChainVerificationError)
+async def chain_verification_error_handler(
+    request, exc: ChainVerificationError
+) -> JSONResponse:
+    # 验链失败：不返回任何历史内容
+    return JSONResponse(status_code=409, content={"detail": str(exc)})
 
 
 @app.exception_handler(ReservationConflictError)
@@ -274,3 +288,39 @@ def cancel_reservation(
         expected_version=expected_version,
     )
     return _reservation_to_out(reservation)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_id}/history",
+    response_model=ReservationHistoryResponse,
+)
+def get_reservation_history(reservation_id: int) -> ReservationHistoryResponse:
+    """预约变更历史：按序返回审计事件，并在服务端**重验整条哈希链**。
+
+    - 预约不存在 → 404；
+    - 哈希链任一环节异常（序号断裂、前后哈希不接、摘要不符、规范形式被
+      改动等）→ 409，**响应不包含历史**；
+    - 成功 → 200，事件按 ``seq`` 升序返回；每条事件携带 ``prev_hash``、
+      ``event_hash`` 与 ``canonical_event``，客户端可用同样的
+      ``SHA-256(prev_hash ASCII + canonical_event UTF-8)`` 独立复验。
+
+    事件动作：``create``（创建）、``reschedule``（改期）、``cancel``（取消）；
+    升级前已存在的预约由初始化补写一条 ``baseline`` 基线事件，
+    不伪造其过去的操作。
+    """
+    events = reservation_core.get_reservation_history(reservation_id)
+    return ReservationHistoryResponse(
+        reservation_id=reservation_id,
+        events=[
+            ReservationHistoryEvent(
+                seq=e["seq"],
+                action=e["action"],
+                event_at=e["event_at"],
+                snapshot=ReservationSnapshot(**e["snapshot"]),
+                prev_hash=e["prev_hash"],
+                event_hash=e["event_hash"],
+                canonical_event=e["canonical_event"],
+            )
+            for e in events
+        ],
+    )

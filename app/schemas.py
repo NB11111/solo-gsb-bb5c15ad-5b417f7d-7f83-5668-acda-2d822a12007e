@@ -183,3 +183,44 @@ class ReservationOut(BaseModel):
         examples=[None],
     )
     created_at: str
+
+
+class ReservationSnapshot(BaseModel):
+    """审计事件内的预约快照：结构与 :class:`ReservationOut` 一致。"""
+
+    reservation_id: int
+    request_id: str
+    start_utc: str
+    end_utc: str
+    participants: list[str]
+    version: int
+    status: Literal["active", "canceled"]
+    canceled_at: str | None = None
+    created_at: str
+
+
+class ReservationHistoryEvent(BaseModel):
+    """预约变更历史中的一条审计事件（含可独立复验的哈希材料）。"""
+
+    seq: int = Field(description="该预约维度下从 1 递增、无间断的事件序号")
+    action: Literal["create", "reschedule", "cancel", "baseline"] = Field(
+        description="动作；baseline 为旧数据初始化补写的基线事件",
+    )
+    event_at: str = Field(description="事件时间 ISO 8601（UTC）")
+    snapshot: ReservationSnapshot = Field(description="事件落定后预约的完整快照")
+    prev_hash: str = Field(
+        description="上一条事件的 event_hash；首条为 64 个 0",
+    )
+    event_hash: str = Field(
+        description="SHA-256(prev_hash 的 ASCII 字节 + canonical_event 的 UTF-8 字节)",
+    )
+    canonical_event: str = Field(
+        description="被摘要的规范事件 JSON：无哈希字段、键排序、非 ASCII 不转义、无空白",
+    )
+
+
+class ReservationHistoryResponse(BaseModel):
+    reservation_id: int
+    events: list[ReservationHistoryEvent] = Field(
+        description="按 seq 升序排列的事件；服务端已重验整条哈希链",
+    )

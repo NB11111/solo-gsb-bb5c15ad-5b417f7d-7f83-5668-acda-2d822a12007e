@@ -2,7 +2,10 @@
 
 基于 **Python + FastAPI + 标准库 `zoneinfo`** 的会议候选时段聚合服务，
 并附带 **SQLite 持久化的会议预约接口**（幂等创建、乐观锁版本改期、
-软删除取消、单事务冲突检测）。
+软删除取消、单事务冲突检测）与**可校验的预约变更历史**
+（同一事务内追加、SHA-256 哈希链、读取时整链重验）。
+
+服务默认监听 **8000 端口**（容器内固定 `8000`，可用宿主机 `HOST_PORT` 映射到其他端口）。
 
 每位参与者按**本地星期与钟面时刻**填写每周重复的可用区间并给出 IANA 时区
 （如 `Asia/Shanghai`），服务按具体日期应用夏令时（DST）规则，统一换算到 UTC，
@@ -29,11 +32,12 @@
 ```
 app/
   scheduling.py    # 聚合核心：本地时刻换算、跨午夜拆分、扫描线、排序
-  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测
-  db.py            # SQLite 连接管理与建表（路径可配置）
+  reservations.py  # 预约核心：规范化、幂等创建、乐观锁版本改期/取消、单事务冲突检测、历史读取
+  audit.py         # 变更历史：canonical_event 规范化、SHA-256 哈希链追加与整链重验
+  db.py            # SQLite 连接管理、建表与旧数据无损迁移（含 baseline 补写）
   schemas.py       # Pydantic 请求/响应模型
   main.py          # FastAPI 路由
-tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发）
+tests/             # pytest 测试（DST、跨午夜、排序、预约冲突/幂等/并发、哈希链审计/篡改/迁移）
 Dockerfile
 docker-compose.yml
 requirements.txt  # 运行依赖
@@ -62,6 +66,11 @@ docker compose up --build
 升级到带 `version` / 取消能力的版本后首次启动时，会为**既有数据无损补齐**
 `version=1`、`status='active'`、`canceled_at=NULL`
 （`ALTER TABLE ADD COLUMN ... DEFAULT ...`），无需手工迁移。
+升级到带变更历史的版本后首次启动时，会新建 `reservation_events` 表，
+并为每条**既有预约补写一条 `baseline` 基线事件**作为其哈希链起点
+（序号 1、`prev_hash` 为 64 个 `0`，快照为迁移当时的真实状态；
+事件时间是迁移时刻，**不伪造**过去的创建/改期/取消操作），
+此后的真实改期/取消事件自然续在基线之后。
 
 服务启动后访问 <http://localhost:8000>（Swagger UI 在 <http://localhost:8000/docs>）。
 若 8000 端口被占用：
@@ -370,6 +379,116 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
 
 其他错误：`404`（预约不存在）、`422`（缺少 `expected_version` 或其值 `< 1`）。
 
+### `GET /api/v1/reservations/{reservation_id}/history`
+
+返回某条预约**按序排列的变更历史**，并在服务端**重验整条哈希链**。
+
+- 预约不存在 → `404`；
+- 链上任一环节校验失败（序号断裂、前后哈希不衔接、摘要不符、事件规范形式
+  或列与载荷被改动）→ `409`，**响应不包含历史**；
+- 成功 → `200`，事件按 `seq` 升序返回。
+
+**事件记录**：每次成功的 `create` / `reschedule` / `cancel` 都在**同一数据库
+事务内**追加一条审计事件（任何失败整体回滚，历史不会缺事件或出现孤儿事件；
+失败请求与幂等重放均**不新增事件**）。每条事件包含：
+
+| 字段 | 说明 |
+| --- | --- |
+| `seq` | 该预约维度下从 `1` 递增、无间断的序号 |
+| `action` | `create` / `reschedule` / `cancel`；旧数据初始化补写为 `baseline` |
+| `event_at` | 事件时间（UTC ISO 8601；创建/取消与快照的 `created_at`/`canceled_at` 同一时间戳） |
+| `snapshot` | 事件落定后预约的完整快照（字段同预约响应） |
+| `prev_hash` | 上一条事件的 `event_hash`；首条为 64 个 `0` |
+| `event_hash` | `SHA-256(prev_hash 的 ASCII 字节 + canonical_event 的 UTF-8 字节)` 的十六进制摘要 |
+| `canonical_event` | 被摘要的规范事件 JSON |
+
+**规范事件 `canonical_event`**：
+
+- **不含任何哈希字段**，仅由 `action` / `seq` / `event_at` / `snapshot` 组成；
+- 所有对象的键**按字典序排列**，数组分隔符紧凑，**无空白**；
+- **非 ASCII 字符不转义**（如中文直接以 UTF-8 字符出现，不写成 `\uXXXX`）。
+
+例如（为便于阅读此处保留了缩进，实际 `canonical_event` 为无空白单行）：
+
+```json
+{"action":"create","event_at":"2026-09-18T02:08:08.225058Z","seq":1,"snapshot":{"canceled_at":null,"created_at":"2026-09-18T02:08:08.225058Z","end_utc":"2026-03-09T14:00:00.000000Z","participants":["alice","bob"],"request_id":"req-9f3a","reservation_id":1,"start_utc":"2026-03-09T13:00:00.000000Z","status":"active","version":1}}
+```
+
+每条预约独立成链：
+
+```
+hash_1 = SHA-256("0000…0000" 的 ASCII 字节 + canonical_event_1 的 UTF-8 字节)
+hash_n = SHA-256(hash_(n-1) 的 ASCII 字节 + canonical_event_n 的 UTF-8 字节)
+```
+
+请求示例：
+
+```bash
+curl -s http://localhost:8000/api/v1/reservations/1/history
+```
+
+成功响应（`200`）：
+
+```json
+{
+  "reservation_id": 1,
+  "events": [
+    {
+      "seq": 1,
+      "action": "create",
+      "event_at": "2026-09-18T02:08:08.225058Z",
+      "snapshot": {
+        "reservation_id": 1,
+        "request_id": "req-9f3a",
+        "start_utc": "2026-03-09T13:00:00.000000Z",
+        "end_utc": "2026-03-09T14:00:00.000000Z",
+        "participants": ["alice", "bob"],
+        "version": 1,
+        "status": "active",
+        "canceled_at": null,
+        "created_at": "2026-09-18T02:08:08.225058Z"
+      },
+      "prev_hash": "0000000000000000000000000000000000000000000000000000000000000000",
+      "event_hash": "b132f0a9a293…",
+      "canonical_event": "{\"action\":\"create\",…}"
+    }
+  ]
+}
+```
+
+客户端可用响应里的 `prev_hash` 与 `canonical_event` 按同样规则独立复验，
+例如：
+
+```bash
+curl -s http://localhost:8000/api/v1/reservations/1/history | python3 -c '
+import hashlib, json, sys
+events = json.load(sys.stdin)["events"]
+prev = "0" * 64
+for e in events:
+    assert e["prev_hash"] == prev
+    assert hashlib.sha256(
+        e["prev_hash"].encode("ascii") + e["canonical_event"].encode("utf-8")
+    ).hexdigest() == e["event_hash"]
+    prev = e["event_hash"]
+print("chain OK:", [e["action"] for e in events])'
+```
+
+预约不存在（`404`）：
+
+```json
+{ "detail": "reservation #999 not found" }
+```
+
+验链异常（`409`，不返回 `events`）：
+
+```json
+{ "detail": "reservation #1 audit chain verification failed: seq 1: hash mismatch" }
+```
+
+**旧数据的 `baseline` 事件**：升级前已存在的预约没有真实历史可考，初始化时
+仅补写一条 `baseline`（快照为迁移当时状态，`event_at` 为迁移时刻），
+不虚构过去的创建/改期/取消；对该预约的后续操作照常续链。
+
 ## 测试覆盖要点
 
 - **春季跳变**：不存在的钟面时刻报错；跨越跳变间隙的窗口 UTC 时长缩短（柏林 2026-03-29 00:00–04:00 实际只有 3 小时）。
@@ -387,6 +506,15 @@ curl -s -X DELETE 'http://localhost:8000/api/v1/reservations/1?expected_version=
   同一结果、其他版本 409、取消后改期 409 不复活、并发取消仅一次实际变更；
   以及**旧版数据库启动时无损补齐 `version=1`、`status='active'`、
   `canceled_at=NULL`** 的迁移。
+- **变更历史**：三类成功操作各在同事务追加事件、序号从 1 连续递增、
+  快照即落定状态；失败请求（422/409/404）与幂等重放（创建/取消）不新增
+  事件；`canonical_event` 无哈希字段、键排序、无空白、非 ASCII 不转义；
+  首条 `prev_hash` 为 64 个 `0`、`SHA-256(prev ASCII + canonical UTF-8)`
+  可独立复验；篡改 `event_hash`/`prev_hash`/`canonical_event`/`snapshot`、
+  删除事件造成序号断裂或空链均返回 **409 且不带历史**，不存在返回 **404**；
+  审计写入失败时预约/占用/事件整体回滚、并发改留下连续链；
+  旧版数据库（含无 `version` 列的最老表结构）启动时**无损补写 `baseline`
+  基线事件**且重复初始化幂等，基线之后的真实操作正常续链。
 
 ```bash
 pytest -q
