@@ -11,6 +11,8 @@
   同事务删除全部参与者占用行使时段立即可再预约；预约行保留，
   使相同 ``expected_version`` 的取消重试能幂等返回同一结果，
   且取消后的改期请求被拒绝（不会复活）。
+- 每次**成功**的创建/改期/取消都在同一事务内向 ``reservation_events``
+  追加哈希链审计事件（:mod:`app.audit`）；失败请求与幂等重放不产生事件。
 """
 
 from __future__ import annotations
@@ -21,10 +23,12 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Iterable
 
+from . import audit
 from . import db
 
-# 定宽 UTC 文本格式：字典序即时间序，可直接用于 SQL 范围比较
-_CANON_FMT = "%Y-%m-%dT%H:%M:%S.%fZ"
+# 定宽 UTC 文本格式：字典序即时间序，可直接用于 SQL 范围比较；
+# 审计事件的时间戳与快照共用同一格式（定义在 audit 模块）
+_CANON_FMT = audit.CANON_FMT
 
 
 class ReservationConflictError(Exception):
@@ -199,6 +203,26 @@ def create_reservation(
                 " VALUES (?, ?, ?, ?)",
                 [(reservation_id, pid, start_s, end_s) for pid in participants],
             )
+            # 审计事件与业务写入同一事务：COMMIT 前任一失败则整体回滚，
+            # 不会出现“有预约无事件”或“有事件无预约”
+            snapshot = audit.build_snapshot(
+                reservation_id=reservation_id,
+                request_id=request_id,
+                start_utc=start_s,
+                end_utc=end_s,
+                participants=participants,
+                version=1,
+                status="active",
+                canceled_at=None,
+                created_at=now_s,
+            )
+            audit.append_event(
+                conn,
+                reservation_id=reservation_id,
+                action="created",
+                timestamp=now_s,
+                snapshot=snapshot,
+            )
             conn.execute("COMMIT")
             return Reservation(
                 id=reservation_id,
@@ -308,6 +332,27 @@ def reschedule_reservation(
                 " VALUES (?, ?, ?, ?)",
                 [(reservation_id, pid, start_s, end_s) for pid in participants],
             )
+            now_s = _canon(datetime.now(timezone.utc))
+            # 同事务追加 rescheduled 审计事件：快照为改期后的新状态，
+            # request_id / created_at 沿用原值
+            snapshot = audit.build_snapshot(
+                reservation_id=reservation_id,
+                request_id=row["request_id"],
+                start_utc=start_s,
+                end_utc=end_s,
+                participants=participants,
+                version=current_version + 1,
+                status="active",
+                canceled_at=None,
+                created_at=row["created_at"],
+            )
+            audit.append_event(
+                conn,
+                reservation_id=reservation_id,
+                action="rescheduled",
+                timestamp=now_s,
+                snapshot=snapshot,
+            )
             conn.execute("COMMIT")
             return Reservation(
                 id=reservation_id,
@@ -390,6 +435,26 @@ def cancel_reservation(
                 "DELETE FROM reservation_participants WHERE reservation_id = ?",
                 (reservation_id,),
             )
+            # 同事务追加 canceled 审计事件：快照记录取消后的终态
+            # （status=canceled、version+1、canceled_at）
+            snapshot = audit.build_snapshot(
+                reservation_id=reservation_id,
+                request_id=row["request_id"],
+                start_utc=row["start_utc"],
+                end_utc=row["end_utc"],
+                participants=json.loads(row["participants_key"]),
+                version=current_version + 1,
+                status="canceled",
+                canceled_at=now_s,
+                created_at=row["created_at"],
+            )
+            audit.append_event(
+                conn,
+                reservation_id=reservation_id,
+                action="canceled",
+                timestamp=now_s,
+                snapshot=snapshot,
+            )
             conn.execute("COMMIT")
             return Reservation(
                 id=reservation_id,
@@ -406,5 +471,43 @@ def cancel_reservation(
             # 无活动事务时 rollback 为 no-op；任何失败都保证整体回滚
             conn.rollback()
             raise
+    finally:
+        conn.close()
+
+
+# ---------------------------------------------------------------- 变更历史
+
+
+def get_reservation_history(
+    reservation_id: int,
+    db_path: str | None = None,
+) -> list[dict[str, object]]:
+    """返回预约的变更历史，**按序重放并重验整条哈希链**后才返回。
+
+    - 预约不存在 → :class:`ReservationNotFoundError`（API 层映射为 404）；
+    - 链上任一事件的序号、``prev_hash`` 或哈希重算不一致
+      → :class:`audit.ChainVerificationError`（API 层映射为 409，
+      且不返回任何历史内容）；
+    - 校验通过 → 按 ``seq`` 升序返回事件（含动作、序号、时间、快照、
+      前后哈希与 canonical_event）。
+    """
+    path = db.ensure_initialized(db_path)
+    conn = db.connect(path)
+    try:
+        exists = conn.execute(
+            "SELECT 1 FROM reservations WHERE id = ?",
+            (reservation_id,),
+        ).fetchone()
+        if exists is None:
+            raise ReservationNotFoundError(reservation_id)
+        rows = conn.execute(
+            "SELECT reservation_id, seq, action, timestamp, snapshot,"
+            "       prev_hash, hash, canonical_event"
+            " FROM reservation_events WHERE reservation_id = ?"
+            " ORDER BY seq ASC",
+            (reservation_id,),
+        ).fetchall()
+        # 404 语义优先；存在预约但无事件/链损坏统一视为验链异常（409）
+        return audit.verify_events(rows)
     finally:
         conn.close()

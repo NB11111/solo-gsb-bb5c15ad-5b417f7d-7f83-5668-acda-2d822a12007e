@@ -15,6 +15,7 @@ from fastapi.responses import JSONResponse
 from . import db as db_module
 from . import reservations as reservation_core
 from . import scheduling
+from .audit import CANON_FMT as _AUDIT_CANON_FMT, ChainVerificationError
 from .reservations import (
     RequestIdConflictError,
     ReservationCanceledError,
@@ -26,8 +27,10 @@ from .scheduling import SchedulingError
 from .schemas import (
     AggregationRequest,
     AggregationResponse,
+    HistoryEventOut,
     LocalTimeOut,
     ParticipantIn,
+    ReservationHistoryOut,
     ReservationIn,
     ReservationOut,
     ReservationRescheduleIn,
@@ -52,9 +55,11 @@ app = FastAPI(
         "重复可用区间与 IANA 时区，返回可安排会议的 UTC 候选时段及各自本地时刻。"
         "DST 按具体日期应用：不存在的本地时刻返回 400，歧义时刻统一取 fold=0。"
         "另提供 SQLite 持久化的会议预约接口：单事务冲突检测 + request_id 幂等，"
-        "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）。"
+        "支持带乐观版本号的改期（PUT）与软删除取消（DELETE，取消后时段立即释放）；"
+        "每次成功的创建/改期/取消都在同一事务追加 SHA-256 哈希链审计事件，"
+        "可通过 GET 历史接口按序获取并由服务端重验整链。"
     ),
-    version="1.3.0",
+    version="1.4.0",
     lifespan=lifespan,
 )
 
@@ -110,6 +115,17 @@ async def reservation_canceled_handler(request, exc: ReservationCanceledError) -
             "detail": str(exc),
             "current_version": exc.current_version,
         },
+    )
+
+
+@app.exception_handler(ChainVerificationError)
+async def chain_verification_error_handler(
+    request, exc: ChainVerificationError
+) -> JSONResponse:
+    # 验链失败：不返回任何历史内容，仅告知链已损坏的位置/原因
+    return JSONResponse(
+        status_code=409,
+        content={"detail": f"reservation history chain verification failed: {exc}"},
     )
 
 
@@ -205,6 +221,26 @@ def _reservation_to_out(r: reservation_core.Reservation) -> ReservationOut:
     )
 
 
+def _snapshot_to_out(snapshot: dict) -> ReservationOut:
+    """审计事件中的快照（定宽 UTC 文本）转 API 输出（ISO 8601 带 Z）。"""
+    def _z(ts: str) -> str:
+        return _iso_z(datetime.strptime(ts, _AUDIT_CANON_FMT)
+                      .replace(tzinfo=timezone.utc))
+
+    return ReservationOut(
+        reservation_id=snapshot["reservation_id"],
+        request_id=snapshot["request_id"],
+        start_utc=_z(snapshot["start_utc"]),
+        end_utc=_z(snapshot["end_utc"]),
+        participants=list(snapshot["participants"]),
+        version=snapshot["version"],
+        status=snapshot["status"],
+        canceled_at=_z(snapshot["canceled_at"])
+            if snapshot["canceled_at"] is not None else None,
+        created_at=_z(snapshot["created_at"]),
+    )
+
+
 @app.post("/api/v1/reservations", response_model=ReservationOut, status_code=201)
 def create_reservation(req: ReservationIn, response: Response) -> ReservationOut:
     """创建会议预约（同步函数，在线程池中执行以避免阻塞事件循环）。
@@ -274,3 +310,39 @@ def cancel_reservation(
         expected_version=expected_version,
     )
     return _reservation_to_out(reservation)
+
+
+@app.get(
+    "/api/v1/reservations/{reservation_id}/history",
+    response_model=ReservationHistoryOut,
+)
+def get_reservation_history(reservation_id: int) -> ReservationHistoryOut:
+    """预约变更历史：按 ``seq`` 升序返回哈希链审计事件，返回前重验整链。
+
+    - 预约不存在 → ``404``；
+    - 哈希链任一环重验失败（序号断档、``prev_hash`` 不衔接、
+      ``canonical_event`` 与哈希不符等）→ ``409``，**不返回任何历史**；
+    - 校验通过 → ``200``，事件包含动作（``created`` / ``rescheduled`` /
+      ``canceled`` / ``baseline``）、序号、时间、预约快照、前后哈希与
+      canonical_event。``baseline`` 为升级初始化时为既有预约补写的快照，
+      不是伪造的历史操作。
+
+    仅成功的创建/改期/取消会产生事件；失败请求与幂等重放不产生事件。
+    """
+    events = reservation_core.get_reservation_history(reservation_id)
+    return ReservationHistoryOut(
+        reservation_id=reservation_id,
+        events=[
+            HistoryEventOut(
+                seq=e["seq"],
+                action=e["action"],
+                timestamp=_iso_z(datetime.strptime(e["timestamp"], _AUDIT_CANON_FMT)
+                                 .replace(tzinfo=timezone.utc)),
+                snapshot=_snapshot_to_out(e["snapshot"]),
+                prev_hash=e["prev_hash"],
+                hash=e["hash"],
+                canonical_event=e["canonical_event"],
+            )
+            for e in events
+        ],
+    )
